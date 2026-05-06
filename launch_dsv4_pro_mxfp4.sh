@@ -36,16 +36,17 @@ set -euo pipefail
 
 PORT="${PORT:-30010}"
 MODEL="${MODEL:-/hf/DeepSeek-V4-Pro-srt}"
-MEM_FRACTION="${MEM_FRACTION_OVERRIDE:-0.85}"   # Hardcoded 0.85 (override with MEM_FRACTION_OVERRIDE)
+MEM_FRACTION="${MEM_FRACTION_OVERRIDE:-0.75}"   # Lowered to leave headroom for warmup + inference activations
 MAX_RUNNING_REQ="${MAX_RUNNING_REQ:-16}"
 CONTEXT_LEN="${CONTEXT_LEN:-1048576}"
 INDEXER_CAP="${INDEXER_CAP:-4096}"
-CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-1 2 4 8 16 32}"
+CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-1 2 4}"
 
 export PYTHONPATH=/sgl-pr/python:${PYTHONPATH:-}
 export MAX_JOBS=128
 # Packed mxfp4 path — required for Pro to fit on 288 GB / GPU.
 export SGLANG_MXFP4_AITER=1
+export SGLANG_FORCE_MXFP4_SERIALIZED=1
 # Compressor + indexer (matches Flash-Base / Pro-Base setup).
 export SGLANG_OPT_USE_FUSED_COMPRESS=false
 export SGLANG_OPT_USE_OLD_COMPRESSOR=false
@@ -55,6 +56,8 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=false
 export SGLANG_HACK_FLASHMLA_BACKEND=torch
 # CK V32 sparse MLA decode is default-on via source change.
 # export SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1
+# Enable two-shot CK V32 at decode to avoid ref_sparse_attn_decode OOM on Pro.
+export SGLANG_HIP_CK_V32_TWO_SHOT=1
 
 # Phase E (2026-04-28) — same combine-kernel gates as Flash-Base / Pro-Base.
 # Pro-mxfp4 routes through the same sparse MLA combine path. See
@@ -87,6 +90,7 @@ export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=0
 export SGLANG_INDEXER_MAX_SEQ_LEN="$INDEXER_CAP"
 export TORCH_COMPILE_DISABLE="${TORCH_COMPILE_DISABLE:-1}"
 export TORCHINDUCTOR_DISABLE="${TORCHINDUCTOR_DISABLE:-1}"
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 
 echo "==================================================================="
 echo "Pro-mxfp4 launcher  (TP=8 EP=8 packed-mxfp4 path)"
@@ -102,7 +106,7 @@ exec python3 -m sglang.launch_server \
   --host 0.0.0.0 --disable-shared-experts-fusion \
   --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
   --skip-server-warmup --watchdog-timeout 1800 \
-  --tp 8 --ep-size 1 --cuda-graph-bs $CUDA_GRAPH_BS \
+  --tp 8 --ep-size 8 --cuda-graph-bs $CUDA_GRAPH_BS \
   --num-continuous-decode-steps "${NUM_DECODE_STEPS:-1}" \
   ${ENABLE_PIECEWISE_CG:+--enable-piecewise-cuda-graph} \
   ${PIECEWISE_TOKENS:+--piecewise-cuda-graph-tokens $PIECEWISE_TOKENS} \
