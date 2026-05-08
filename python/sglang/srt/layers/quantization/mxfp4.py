@@ -242,6 +242,14 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant):
+        if os.environ.get("SGLANG_FORCE_MXFP4_SERIALIZED", "0") == "1":
+            quant_method = hf_quant_cfg.get("quant_method", "").lower() if hf_quant_cfg else ""
+            if quant_method == "fp8":
+                return cls.get_name()
+        return None
+
     def is_static_cfg(self):
         return self.is_checkpoint_mxfp4_serialized
 

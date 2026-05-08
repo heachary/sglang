@@ -2,7 +2,7 @@
 
 IMAGE_NAME=rocm/sgl-dev:rocm720-deepseek-v4-mi35x
 CONTAINER_NAME=sgl-deepseek-v4-mi35x-rocm720
-SGLANG_WORKDIR=/home/heachary/Code/sglang
+SGLANG_WORKDIR=/home/akadhaka/sglang
 HF_DIR=/data/workloads-inference/models
 
 docker run -it --rm -d --privileged --name $CONTAINER_NAME \

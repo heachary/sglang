@@ -461,14 +461,17 @@ class ModelConfig:
             if envs.SGLANG_DSV4_MODE.get() == "2604":
                 self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
-            self.compress_ratios = self.hf_config.compress_ratios
+            #self.compress_ratios = self.hf_config.compress_ratios
+            self.compress_ratios = getattr(self.hf_config, 'compress_ratios', None) or self.hf_config.compress_rates
+
             self.attention_arch = AttentionArch.MHA
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
             if self.hf_config.rope_scaling:
-                mscale_all_dim = self.hf_config.rope_scaling.get(
-                    "mscale_all_dim", False
-                )
-                scaling_factor = self.hf_config.rope_scaling["factor"]
+                rope_cfg = self.hf_config.rope_scaling
+                if "main" in rope_cfg:
+                    rope_cfg = rope_cfg["main"]
+                mscale_all_dim = rope_cfg.get("mscale_all_dim", False)
+                scaling_factor = rope_cfg["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
 
