@@ -890,6 +890,20 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = False
+    enable_dp_mixed_prefill_decode: A[
+        bool,
+        (
+            "With dp-attention + speculative decoding, let a rank that has only "
+            "decode work keep running it while a peer rank prefills, instead of "
+            "being handed an idle batch. The step is then mode-mixed: the "
+            "prefilling ranks pad it with zero-token draft-propose forwards so "
+            "every rank still enters the same per-layer DP collectives in the "
+            "same order. Speculation is preserved on the decoding ranks. Mixed "
+            "steps fall back to eager on every rank, since a captured decode "
+            "graph bakes in a mode-homogeneous global DP layout."
+        ),
+        NS("schedule"),
+    ] = False
     enable_step_time_logging: A[
         bool,
         "Append per-step GPU time (CUDA-event timed) to each Prefill/Decode batch log line. Generation models only.",

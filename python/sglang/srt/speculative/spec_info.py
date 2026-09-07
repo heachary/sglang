@@ -395,6 +395,21 @@ class SpecInput(ABC):
             SpecInputType.DFLASH_DRAFT,
         }
 
+    def is_draft_propose_input(self) -> bool:
+        """Draft-model forwards that PROPOSE tokens.
+
+        Narrower than is_draft_input, which also covers the draft-extend
+        forwards. ForwardBatch padding needs the distinction: on a dp mixed
+        prefill/decode step an extending rank's propose slots are idle filler
+        contributing zero tokens, while its draft_extend processes the prompt's
+        real tokens and must keep the ordinary token vector.
+        """
+        return self.spec_input_type in {
+            SpecInputType.EAGLE_DRAFT,
+            SpecInputType.FROZEN_KV_MTP_DRAFT,
+            SpecInputType.DFLASH_DRAFT,
+        }
+
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,

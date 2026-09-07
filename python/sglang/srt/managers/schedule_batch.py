@@ -2254,6 +2254,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    # dp-attention: some rank extends while some rank decodes this step.
+    dp_mixed_step: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -2306,6 +2308,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
+    # Per-rank tokens for ONE draft-model forward (dp mixed prefill/decode).
+    global_num_tokens_draft: Optional[List[int]] = None
+    # Per-rank TARGET-forward tokens, token units (dp mixed prefill/decode).
+    global_num_tokens_target: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
@@ -2955,6 +2961,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = False
 
+    def copy_for_idle_draft(self) -> ScheduleBatch:
+        """An IDLE view of this batch carrying its dp-sync metadata.
+
+        Used to drive collective-only draft-propose forwards on a rank that is
+        extending, so it matches a decoding peer's sequence on a dp mixed step.
+        Holds no requests: the forwards exist purely to enter the collectives.
+        """
+        idle = ScheduleBatch.init_new(
+            [],
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        idle.prepare_for_idle()
+        # The sync metadata must match what the peers gathered, or the padding
+        # in prepare_mlp_sync_batch disagrees across ranks.
+        idle.global_num_tokens = self.global_num_tokens
+        idle.global_num_tokens_draft = self.global_num_tokens_draft
+        idle.global_num_tokens_target = self.global_num_tokens_target
+        idle.global_num_tokens_for_logprob = self.global_num_tokens_for_logprob
+        idle.global_forward_mode = self.global_forward_mode
+        idle.is_extend_in_batch = self.is_extend_in_batch
+        idle.dp_mixed_step = self.dp_mixed_step
+        idle.can_run_dp_prefill_cuda_graph = self.can_run_dp_prefill_cuda_graph
+        return idle
+
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
         prefix, making this a plain extend (prefill) batch. Called after the
@@ -3550,10 +3585,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
+            global_num_tokens_draft=self.global_num_tokens_draft,
+            global_num_tokens_target=self.global_num_tokens_target,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            dp_mixed_step=self.dp_mixed_step,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

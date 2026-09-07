@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -35,9 +36,13 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -84,6 +89,21 @@ def _resolve_elastic_world_dp_size(
     return live_dp_size
 
 
+# Column layout of the MLP-sync payload. This tensor crosses an all_gather, so
+# an index shift here desynchronises ranks silently instead of raising -- name
+# the columns rather than indexing by literal.
+_SYNC_NUM_TOKENS = 0
+_SYNC_NUM_TOKENS_FOR_LOGPROB = 1
+_SYNC_NUM_TOKENS_DRAFT = 2
+_SYNC_NUM_TOKENS_TARGET = 3
+_SYNC_CAN_RUN_DECODE_CUDA_GRAPH = 4
+_SYNC_IS_EXTEND_IN_BATCH = 5
+_SYNC_LOCAL_CAN_RUN_TBO = 6
+_SYNC_LOCAL_FORWARD_MODE = 7
+_SYNC_CAN_RUN_PREFILL_CUDA_GRAPH = 8
+_SYNC_NUM_COLS = 9
+
+
 @dataclass
 class MLPSyncBatchInfo:
     dp_size: int
@@ -92,6 +112,22 @@ class MLPSyncBatchInfo:
 
     num_tokens: int
     num_tokens_for_logprob: int
+    # Tokens this rank pushes through ONE draft-model forward. On a
+    # mode-homogeneous step every rank derives this from `num_tokens` via
+    # spec_scale_global_num_tokens, but that scaling is a single uniform
+    # multiplier over the whole gathered vector: it cannot describe a step
+    # where one rank prefills (its entry is already a token count) while
+    # another decodes (its entry is a request count awaiting the spec width).
+    # Gathering the draft-phase token count explicitly is what lets those two
+    # coexist. 0 on a rank with no decode work -- including a prefilling rank,
+    # whose draft slots are idle filler.
+    num_tokens_draft: int
+    # Tokens this rank pushes through the TARGET forward, already in token
+    # units. global_num_tokens is mixed-unit -- a token count on an extending
+    # rank, a request count awaiting the spec width on a decoding one -- which
+    # the single uniform scale factor cannot reconcile once both appear in the
+    # same step. Used in place of it (unscaled) when dp_mixed_step is set.
+    num_tokens_target: int
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
     is_extend_in_batch: bool
@@ -99,8 +135,13 @@ class MLPSyncBatchInfo:
     local_forward_mode: int
 
     # some gathered elements
+    has_decode_in_batch: bool = False
+    dp_mixed_step: bool = False
+
     tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
+    global_num_tokens_draft: list[int] = None
+    global_num_tokens_target: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
@@ -111,6 +152,8 @@ class MLPSyncBatchInfo:
             [
                 self.num_tokens,
                 self.num_tokens_for_logprob,
+                self.num_tokens_draft,
+                self.num_tokens_target,
                 int(self.can_run_decode_cuda_graph),
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
@@ -126,6 +169,8 @@ class MLPSyncBatchInfo:
             [
                 0,  # num_tokens
                 0,  # num_tokens_for_logprob
+                0,  # num_tokens_draft
+                0,  # num_tokens_target
                 1,  # can_run_decode_cuda_graph
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
@@ -143,7 +188,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
-                self.tp0_info_cpu[:, 5].tolist()
+                self.tp0_info_cpu[:, _SYNC_LOCAL_FORWARD_MODE].tolist()
             )
 
     def all_gather(
@@ -207,14 +252,32 @@ class MLPSyncBatchInfo:
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
-        self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
-        self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
-        self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
-        self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
-        self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.global_num_tokens = tp0_info_cpu[:, _SYNC_NUM_TOKENS].tolist()
+        self.global_num_tokens_draft = tp0_info_cpu[:, _SYNC_NUM_TOKENS_DRAFT].tolist()
+        self.global_num_tokens_target = tp0_info_cpu[
+            :, _SYNC_NUM_TOKENS_TARGET
+        ].tolist()
+        self.global_num_tokens_for_logprob = tp0_info_cpu[
+            :, _SYNC_NUM_TOKENS_FOR_LOGPROB
+        ].tolist()
+        self.can_run_decode_cuda_graph = bool(
+            tp0_info_cpu[:, _SYNC_CAN_RUN_DECODE_CUDA_GRAPH].min()
+        )
+        self.is_extend_in_batch = bool(tp0_info_cpu[:, _SYNC_IS_EXTEND_IN_BATCH].max())
+        # A step is "mixed" when at least one rank extends and at least one
+        # decodes. Derived from the already-gathered forward-mode column, so
+        # every rank reaches the same verdict without another collective.
+        # This is what tells an extending rank it must pad its step with idle
+        # draft-propose forwards to match a decoding peer's sequence.
+        modes = tp0_info_cpu[:, _SYNC_LOCAL_FORWARD_MODE].tolist()
+        self.has_decode_in_batch = any(m == ForwardMode.DECODE.value for m in modes)
+        self.dp_mixed_step = self.is_extend_in_batch and self.has_decode_in_batch
+        self.can_run_prefill_cuda_graph = bool(
+            tp0_info_cpu[:, _SYNC_CAN_RUN_PREFILL_CUDA_GRAPH].min()
+        )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
-                tp0_info_cpu[:, 5].tolist()
+                tp0_info_cpu[:, _SYNC_LOCAL_FORWARD_MODE].tolist()
             )
 
 
@@ -228,13 +291,18 @@ def _update_gather_batch(
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.global_num_tokens_draft = [mlp_sync_info.num_tokens_draft]
+        batch.global_num_tokens_target = [mlp_sync_info.num_tokens_target]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        batch.global_num_tokens_draft = mlp_sync_info.global_num_tokens_draft
+        batch.global_num_tokens_target = mlp_sync_info.global_num_tokens_target
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+        batch.dp_mixed_step = mlp_sync_info.dp_mixed_step
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
@@ -368,11 +436,28 @@ def prepare_mlp_sync_batch_raw(
     ):
         num_tokens = 0
         num_tokens_for_logprob = 0
+        num_tokens_draft = 0
+        num_tokens_target = 0
     elif local_batch.forward_mode.is_decode():
         num_tokens = local_batch.batch_size()
         num_tokens_for_logprob = num_tokens
+        # Same request-count units as num_tokens, so the existing uniform
+        # spec scaling reproduces today's value exactly on a homogeneous
+        # decode step. What it buys is the mixed case: a prefilling rank
+        # reports 0 here, and 0 survives any scale factor.
+        num_tokens_draft = num_tokens
+        # Pre-scaled into token units so it stays comparable with an extending
+        # peer's entry; the verify forward is num_draft_tokens wide per request.
+        num_tokens_target = num_tokens * max(
+            1, get_spec().speculative_num_draft_tokens or 1
+        )
     else:
         num_tokens = local_batch.extend_num_tokens
+        # An extending rank issues no drafts of its own; its draft slots are
+        # idle filler that must still enter the collective.
+        num_tokens_draft = 0
+        # Already a token count.
+        num_tokens_target = num_tokens
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
@@ -443,6 +528,8 @@ def prepare_mlp_sync_batch_raw(
         cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
+        num_tokens_draft=num_tokens_draft,
+        num_tokens_target=num_tokens_target,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
@@ -463,7 +550,9 @@ def prepare_mlp_sync_batch_raw(
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info_cpu[:, 4:6],
+                mlp_sync_info.tp0_info_cpu[
+                    :, _SYNC_LOCAL_CAN_RUN_TBO : _SYNC_LOCAL_FORWARD_MODE + 1
+                ],
             )
         )
 
@@ -495,7 +584,7 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is not None and metadata_ready:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
-                mlp_sync_info.tp0_info_cpu[:, 5].tolist()
+                mlp_sync_info.tp0_info_cpu[:, _SYNC_LOCAL_FORWARD_MODE].tolist()
             )
         )
 
@@ -594,3 +683,42 @@ class SchedulerDPAttnAdapter:
         )
         idle_batch.prepare_for_idle()
         return idle_batch
+
+
+def _debug_dp_mixed_kv(batch, tag: str) -> None:
+    """Dump allocator/tree accounting around a dp-mixed conversion.
+
+    num_used = capacity - (available + evictable); it went negative in the
+    first dp-mixed run, meaning slots were counted free AND evictable at the
+    same time. Gated on SGLANG_DEBUG_DP_MIXED_KV so it costs nothing normally.
+    """
+    if not envs.SGLANG_DEBUG_DP_MIXED_KV.get():
+        return
+    try:
+        alloc = batch.token_to_kv_pool_allocator
+        tree = batch.tree_cache
+        avail = alloc.available_size()
+        evict = tree.evictable_size() if hasattr(tree, "evictable_size") else -1
+        rows = " ".join(
+            f"{r.kv.kv_committed_len}/{r.kv.kv_allocated_len}" for r in batch.reqs[:4]
+        )
+        # SWA cursors: swa_evicted_seqlen only advances, and free_swa frees the
+        # row range [old, new). If that range still holds spec draft-slot
+        # indices from the previous speculated iteration, they get freed twice.
+        swa = " ".join(
+            f"{r.kv.swa_evicted_seqlen}|{r.kv.swa_evict_floor}|{r.kv.cache_protected_len}"
+            for r in batch.reqs[:4]
+        )
+        logger.info(
+            "[dp-mixed-kv] %s bs=%d avail=%d evict=%d size=%d "
+            "committed/allocated: %s || swa evicted|floor|protected: %s",
+            tag,
+            len(batch.reqs),
+            avail,
+            evict,
+            alloc.size,
+            rows,
+            swa,
+        )
+    except Exception as e:  # diagnostics must never take the scheduler down
+        logger.info("[dp-mixed-kv] %s failed: %r", tag, e)

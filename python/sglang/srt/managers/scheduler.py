@@ -3470,6 +3470,12 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
+        # Set when this rank has only decode work while a peer rank prefills.
+        # With enable_dp_mixed_prefill_decode the rank keeps its normal
+        # speculative decode batch instead of taking an idle batch; the peers
+        # that prefill pad their step with idle draft forwards so every rank
+        # still issues the same sequence of dp collectives.
+        dp_mixed_decode = False
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -3479,8 +3485,26 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
-            need_mlp_sync = new_batch is None
+            probed = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
+            if self.server_args.enable_dp_mixed_prefill_decode:
+                # This gather is only a probe for "is a peer extending": it ran
+                # before this rank's decode batch existed, so its token counts
+                # cannot describe the batch we are about to build. Every rank
+                # therefore re-syncs below -- unconditionally, so the collective
+                # count matches across ranks whatever each one decides here.
+                dp_mixed_decode = (
+                    new_batch is None
+                    and probed is not None
+                    and probed.forward_mode.is_idle()
+                    and probed.is_extend_in_batch
+                    and not running_batch.is_empty()
+                    and not running_batch.is_prefill_only
+                )
+                new_batch = None if dp_mixed_decode else probed
+                need_mlp_sync = True
+            else:
+                new_batch = probed
+                need_mlp_sync = new_batch is None
 
         if new_batch is not None:
             # Run prefill first if possible

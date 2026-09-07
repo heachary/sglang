@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -128,6 +129,15 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+_DBG_DP_MIXED = os.environ.get("SGLANG_DEBUG_DP_MIXED", "0") == "1"
+
+
+def _dbg_mixed(tag: str, **kv) -> None:
+    """One line per spec phase, so a hung step can be diffed across ranks."""
+    if not _DBG_DP_MIXED:
+        return
+    logger.info("[dpmix] %s %s", tag, " ".join(f"{k}={v}" for k, v in kv.items()))
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -531,6 +541,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             can_run_decode_cuda_graph = False
 
+        # dp mixed prefill/decode: this gate is decided locally, so on a mixed
+        # step a decoding rank would replay a captured graph while its
+        # extending peer runs the same phase eagerly. Graph replay pads the dp
+        # all-gather to the captured bucket and eager pads to the exact global
+        # size, so the two disagree on the collective's shape and the step
+        # hangs. dp_mixed_step is a globally-agreed verdict, so keying off it
+        # puts every rank on the eager path together.
+        if getattr(batch, "dp_mixed_step", False):
+            can_run_decode_cuda_graph = False
+        _dbg_mixed(
+            "propose",
+            mode=forward_batch.forward_mode.name,
+            graph=can_run_decode_cuda_graph,
+            mixed=getattr(batch, "dp_mixed_step", None),
+        )
+
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
             c.with_ops_outside_graph(
@@ -865,6 +891,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
+        _dbg_mixed(
+            "draft_extend_prefill",
+            mode=forward_batch.forward_mode.name,
+            mixed=getattr(batch, "dp_mixed_step", None),
+        )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -959,6 +990,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         can_run_decode_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
+        )
+        # Same globally-agreed eager fallback as the propose phase above: an
+        # extending peer reaches this phase through _draft_extend_for_prefill,
+        # which is always eager, so a graph replay here would mismatch it.
+        if getattr(batch, "dp_mixed_step", False):
+            can_run_decode_cuda_graph = False
+        _dbg_mixed(
+            "draft_extend_decode",
+            graph=can_run_decode_cuda_graph,
+            mixed=getattr(batch, "dp_mixed_step", None),
         )
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
@@ -1174,13 +1215,43 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ):
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        # is_extend_in_batch is a max-reduce across dp ranks, so it is set on
+        # every rank as soon as one of them extends. Without dp mixed
+        # prefill/decode that is harmless -- the mlp sync forces mode
+        # homogeneity, so a rank seeing it either extends itself or holds an
+        # idle batch, and both belong on the target-prefill path. On a mixed
+        # step a rank can hold a real DECODE batch while a peer extends; that
+        # rank must stay on the speculative decode path below (its input_ids
+        # are relayed through the future map and are None here, which is how
+        # this surfaces). Route on the local mode, and keep is_extend_in_batch
+        # only for the idle ranks that still have to follow the peers.
+        _dbg_mixed(
+            "enter",
+            mode=batch.forward_mode.name,
+            ext_in_batch=batch.is_extend_in_batch,
+            mixed=getattr(batch, "dp_mixed_step", None),
+            gnt=batch.global_num_tokens,
+            gnt_draft=getattr(batch, "global_num_tokens_draft", None),
+            gnt_target=getattr(batch, "global_num_tokens_target", None),
+        )
+        if batch.forward_mode.is_extend() or (
+            batch.is_extend_in_batch and not batch.forward_mode.is_decode()
+        ):
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
+            # dp mixed prefill/decode: a peer rank is running a full
+            # speculative decode this step, which issues speculative_num_steps
+            # draft-propose forwards before its target forward. Every dp rank
+            # must enter the same per-layer collectives in the same order, so
+            # pad this extending rank with the same number of idle proposes.
+            # They carry zero tokens (num_tokens_draft is 0 for an extending
+            # rank) and exist only to keep the ranks in step.
+            self._maybe_run_idle_draft_proposes(batch)
+
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -1274,6 +1345,43 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def _maybe_run_idle_draft_proposes(self, batch: ScheduleBatch) -> None:
+        """Run idle draft-propose forwards so an extending rank matches a
+        decoding peer's collective sequence on a dp mixed step.
+
+        No-op unless dp_mixed_step is set (a globally-agreed verdict from the
+        mlp sync, so every rank makes the same decision) and this rank owns a
+        draft worker. The draft input is the same idle construct an idle rank
+        already uses when its peers decode.
+        """
+        if not getattr(batch, "dp_mixed_step", False):
+            _dbg_mixed("idle_pad", fired=False, why="not_mixed")
+            return
+        if self._draft_worker is None or self.speculative_num_steps == 0:
+            _dbg_mixed("idle_pad", fired=False, why="no_draft_or_zero_steps")
+            return
+        _dbg_mixed("idle_pad", fired=True, steps=self.speculative_num_steps)
+
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_worker.draft_runner
+        )
+        idle_batch = batch.copy_for_idle_draft()
+        idle_batch.spec_info = EagleDraftInput.create_idle_input(
+            device=self.device,
+            hidden_size=hidden_size,
+            dtype=hidden_dtype,
+            topk=self.topk,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            vocab_size=self.target_worker.model_config.vocab_size,
+        )
+        with (
+            self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_idle_pad"),
+        ):
+            self.draft_worker.draft(idle_batch)
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

@@ -28,6 +28,8 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -99,6 +101,11 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+logger = logging.getLogger(__name__)
+
+_DBG_DP_MIXED_FB = os.environ.get("SGLANG_DEBUG_DP_MIXED", "0") == "1"
 
 
 class ForwardMode(IntEnum):
@@ -691,19 +698,69 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return
 
         assert batch.global_num_tokens_for_logprob is not None
-        if self.spec_info is not None:
+        # A mixed dp step needs the target vector on every forward that is not
+        # a draft propose -- including ones with no spec_info at all. The
+        # target prefill on an extending rank is exactly that case: nothing
+        # attaches a spec_info before it, so it used to fall through to the
+        # raw global_num_tokens, whose decoding-rank entries are request
+        # counts while its own are token counts. Its decoding peer reached the
+        # same collective through the verify forward (which does carry a
+        # spec_info) and sized it from the target vector, so the two disagreed
+        # on the all-gather length by exactly the spec scale and the step
+        # deadlocked. Decide on dp_mixed_step first, independently of
+        # spec_info.
+        is_draft_propose = (
+            self.spec_info is not None and self.spec_info.is_draft_propose_input()
+        )
+        if (
+            getattr(batch, "dp_mixed_step", False)
+            and not is_draft_propose
+            and batch.global_num_tokens_target is not None
+        ):
+            global_num_tokens = batch.global_num_tokens_target
+            global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+        elif self.spec_info is not None:
             from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
+
+            # Draft-model forwards take the draft-phase vector. On a
+            # mode-homogeneous decode step it is identical to
+            # global_num_tokens, so this is a no-op there. It differs only on a
+            # dp mixed prefill/decode step, where a prefilling rank contributes
+            # 0 draft tokens (its draft slots are idle filler) while its
+            # global_num_tokens entry holds a real extend token count that the
+            # uniform spec scaling below must not be applied to.
+            # Only the draft PROPOSE forwards take the draft-phase vector.
+            # is_draft_input() is a union that also covers draft_extend, which
+            # carries EAGLE_DRAFT_EXTEND and processes this step's real tokens
+            # (on a prefill step it extends the draft KV over the prompt).
+            # Feeding that the draft vector pads an extending rank to 0 and
+            # fails with a negative dimension. Note forward_mode is no help
+            # here: prefill draft_extend inherits EXTEND from its parent batch.
+            base_num_tokens = batch.global_num_tokens
+            if is_draft_propose and batch.global_num_tokens_draft is not None:
+                base_num_tokens = batch.global_num_tokens_draft
 
             global_num_tokens, global_num_tokens_for_logprob = (
                 spec_scale_global_num_tokens(
                     self.spec_info,
-                    batch.global_num_tokens,
+                    base_num_tokens,
                     batch.global_num_tokens_for_logprob,
                 )
             )
         else:
             global_num_tokens = batch.global_num_tokens
             global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+
+        if _DBG_DP_MIXED_FB:
+            logger.info(
+                "[dpmix] vec mode=%s spec=%s mixed=%s propose=%s chosen=%s sum=%s",
+                self.forward_mode.name,
+                type(self.spec_info).__name__ if self.spec_info else None,
+                getattr(batch, "dp_mixed_step", None),
+                is_draft_propose,
+                global_num_tokens,
+                sum(global_num_tokens),
+            )
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
