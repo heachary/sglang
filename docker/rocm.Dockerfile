@@ -50,6 +50,26 @@ ARG BASE_IMAGE_950_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_1250_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_ROCM1000="ubuntu:24.04"
 
+# ROCr + CLR (the HSA runtime and the HIP/OpenCL runtime) rebuilt from source, to
+# pick up multi-stream fixes that have not reached a ROCm release yet. Ported from
+# vllm-project/vllm#55099 (its docker/Dockerfile.rocm_base half).
+#
+# The pinned commit is ROCm's 7.2.4 line, carrying:
+#   - rocm-systems#11212, device-resident ordering edges. A cross-stream wait is
+#     recorded as GPU-side wait packets instead of bouncing through the host, so
+#     the overlap SGLang already expresses with multiple HIP streams (dual-stream
+#     decode, shared-expert MoE overlap, ...) actually overlaps on the device.
+#   - rocm-systems#6942, release the GWS queue on shutdown. Fixes a use-after-free
+#     that SIGSEGVs in HIP's atexit handler on cooperative-launch paths.
+# Drop this once both land in the stock ROCm the base images ship.
+ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
+ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
+# Applies to the ROCm 7.x flavors, which keep ROCm at /opt/rocm. The *-rocm1000
+# flavors take the whole stack from AMD's wheels (site-packages/_rocm_sdk_*, a
+# different layout) and ROCm 10 already carries these fixes, so the stage below
+# no-ops for them regardless of this value. Set to 0 to ship stock ROCr + CLR.
+ARG ENABLE_ROCM_RUNTIME_PATCH=1
+
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
 
@@ -331,6 +351,99 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
 FROM scratch AS local_src
 COPY . /src
+
+# ===============================
+# ROCr + CLR build.
+#
+# Its own stage, off the selected arch base, so that bumping ROCM_RUNTIME_COMMIT
+# rebuilds only this and not the whole SGLang/AITER/TileLang compile below. That
+# is safe because both libraries are loaded dynamically: everything downstream
+# compiles against the base image's ROCm headers and stubs, and only the runtime
+# that the shipped image loads is swapped, at the very end of the final stage.
+FROM ${GPU_ARCH} AS build_rocm_runtime
+ARG GPU_ARCH
+ARG ROCM_SYSTEMS_REPO
+ARG ROCM_RUNTIME_COMMIT
+ARG ENABLE_ROCM_RUNTIME_PATCH
+
+# Fetch sources and set up the build. /staging is created unconditionally: the
+# final stage COPYs from it either way, and an empty directory is how this stage
+# reports "not applicable" for the rocm1000 flavors.
+RUN set -eux; \
+    mkdir -p /staging/lib; \
+    case "${GPU_ARCH}" in \
+      *rocm1000*) \
+        echo "[ROCr/CLR] ${GPU_ARCH}: ROCm comes from pip wheels and already has these fixes, skipping"; \
+        exit 0; \
+        ;; \
+    esac; \
+    if [ "${ENABLE_ROCM_RUNTIME_PATCH}" != "1" ]; then \
+      echo "[ROCr/CLR] ENABLE_ROCM_RUNTIME_PATCH=${ENABLE_ROCM_RUNTIME_PATCH}, keeping the base image runtime"; \
+      exit 0; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        g++ libelf-dev libdrm-dev libnuma-dev libdw-dev xxd; \
+    rm -rf /var/lib/apt/lists/*; \
+    # CppHeaderParser is a build-time codegen dependency of ROCr. cmake<4 because
+    # these trees still declare a pre-3.5 cmake_minimum_required, which CMake 4
+    # rejects outright, and the ROCm 7.2 base ships no cmake at all.
+    pip install --no-cache-dir CppHeaderParser 'cmake<4'; \
+    git init -q /src; \
+    cd /src; \
+    git remote add origin ${ROCM_SYSTEMS_REPO}; \
+    git config core.sparseCheckout true; \
+    git config remote.origin.promisor true; \
+    git config remote.origin.partialclonefilter blob:none; \
+    git sparse-checkout init --cone; \
+    git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake; \
+    git fetch --filter=blob:none --depth 1 origin ${ROCM_RUNTIME_COMMIT}; \
+    git checkout -q FETCH_HEAD; \
+    # ROCr's trap_handler and blit_shaders call find_package(Clang/LLVM REQUIRED) only
+    # to get IMPORTED executables. The ROCm image ships the binaries but no CMake
+    # package config, so supply one pointing at them.
+    mkdir -p /opt/rocm-cmake-shim; \
+    printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake; \
+    printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake
+
+# Build. ROCr first, and installed into /opt/rocm as well as staged, because the
+# clr build below needs its headers.
+RUN set -eux; \
+    [ -d /src/projects/rocr-runtime ] || { echo "[ROCr/CLR] nothing to build"; exit 0; }; \
+    cd /src/projects/rocr-runtime; \
+    cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DClang_DIR=/opt/rocm-cmake-shim \
+        -DLLVM_DIR=/opt/rocm-cmake-shim; \
+    cmake --build build --parallel "$(nproc)"; \
+    cmake --install build; \
+    cmake --install build --prefix /rocr-install --strip; \
+    cd /src/projects/clr; \
+    cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCLR_BUILD_HIP=ON \
+        -DCLR_BUILD_OCL=OFF \
+        -DHIP_COMMON_DIR=/src/projects/hip \
+        -DROCM_PATH=/opt/rocm \
+        -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DLLVM_DIR=/opt/rocm-cmake-shim \
+        -DHIP_LLVM_ROOT=/opt/rocm/llvm; \
+    cmake --build build --parallel "$(nproc)"; \
+    cmake --install build --prefix /clr-install --strip; \
+    cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/; \
+    cp -P /clr-install/lib/libamdhip64.so* /staging/lib/; \
+    # rocclr does find_package(OpenGL) and must not pick up a libGL DT_NEEDED,
+    # since the runtime images have no GL. Assert that it did not. Spelled as an
+    # if rather than `! ... | grep -q` because set -e never fires on a negated
+    # pipeline, which would make the assertion silently unable to fail.
+    if readelf -d /staging/lib/libamdhip64.so.7.* | grep -q 'NEEDED.*libGL'; then \
+        echo "ERROR: patched libamdhip64 links libGL; the runtime images have none"; \
+        exit 1; \
+    fi; \
+    ls -l /staging/lib
 
 # ===============================
 # Chosen arch and args
@@ -1180,5 +1293,47 @@ ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
 ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
+
+# -----------------------
+# Patched ROCr + CLR, from the build_rocm_runtime stage above. Deliberately last:
+# these are dynamically loaded, so nothing above needs to be rebuilt when the
+# runtime pin moves, and every layer before this one stays cached.
+ARG ROCM_SYSTEMS_REPO
+ARG ROCM_RUNTIME_COMMIT
+ARG ENABLE_ROCM_RUNTIME_PATCH
+
+# rocprofiler-sdk's queue interposition can hang at HSA teardown, and torch attaches
+# the profiler implicitly. TODO: drop once ROCm's stock rocprofiler carries the fix.
+ENV ROCPROFILER_QUEUE_INTERPOSITION=0
+
+# Staged under /tmp rather than straight into /opt/rocm/lib because /opt/rocm is a
+# symlink chain (-> /etc/alternatives/rocm -> /opt/rocm-7.2.0) that COPY resolves
+# unreliably. The RUN below resolves it first. Empty when the stage no-opped.
+COPY --from=build_rocm_runtime /staging/lib/ /tmp/rocm-runtime-staging/lib/
+RUN set -eux; \
+    if [ -z "$(ls -A /tmp/rocm-runtime-staging/lib 2>/dev/null)" ]; then \
+        echo "[ROCr/CLR] no staged runtime, keeping the base image libraries"; \
+        rm -rf /tmp/rocm-runtime-staging; \
+        exit 0; \
+    fi; \
+    rocm="$(readlink -f /opt/rocm)"; \
+    cp -Pf /tmp/rocm-runtime-staging/lib/* "$rocm/lib/"; \
+    rm -rf /tmp/rocm-runtime-staging; \
+    cd "$rocm/lib"; \
+    # Hard link the patched library onto every stock file name so that both the
+    # SONAME lookup and the hard coded paths resolve to it. Hard links rather than
+    # symlinks because ldconfig rewrites SONAME symlinks but cannot re-point an inode.
+    ours_hsa="$(readlink -f libhsa-runtime64.so.1)"; \
+    ours_hip="$(readlink -f libamdhip64.so.7)"; \
+    for f in libhsa-runtime64.so.1.*; do \
+        [ "$f" = "${ours_hsa##*/}" ] || ln -f "$ours_hsa" "$f"; \
+    done; \
+    for f in libamdhip64.so.7.*; do \
+        [ "$f" = "${ours_hip##*/}" ] || ln -f "$ours_hip" "$f"; \
+    done; \
+    ldconfig; \
+    printf 'ROCM_SYSTEMS_REPO: %s\nROCM_RUNTIME_COMMIT: %s\nSOURCE: vllm-project/vllm#55099 (ROCr + CLR multi-stream)\n' \
+        "${ROCM_SYSTEMS_REPO}" "${ROCM_RUNTIME_COMMIT}" > /opt/rocm-runtime-patch.txt; \
+    cat /opt/rocm-runtime-patch.txt
 
 CMD ["/bin/bash"]
